@@ -265,9 +265,10 @@ def build_ghl_payload(lead_data: dict, enrichment: dict) -> dict:
 
     return {
         # --- Standard GHL Contact Fields ---
+        # Note: full_name is intentionally excluded to prevent GHL from creating
+        # duplicate contacts. GHL matches existing contacts by email.
         "first_name":   lead_data.get("first_name", ""),
         "last_name":    lead_data.get("last_name", ""),
-        "full_name":    lead_data.get("full_name", ""),
         "email":        lead_data.get("email", ""),
         "phone":        lead_data.get("phone", ""),
 
