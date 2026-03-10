@@ -57,7 +57,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 app = FastAPI(
     title="Manus Lead Enrichment Service",
     description="AI-powered lead enrichment: receives leads from Adstra GHL, researches them, and sends enriched data to Centerfy GHL and Adstra GHL.",
-    version="3.0.0",
+    version="3.2.0",
 )
 
 
