@@ -1,4 +1,4 @@
-# Manus Lead Enrichment Service v2
+# Manus Lead Enrichment Service v2 
 
 An AI-powered lead enrichment microservice that receives leads from **Adstra GHL**, performs intelligent web research on each lead, and sends the enriched data back to **both Centerfy GHL and Adstra GHL** in real time.
 
