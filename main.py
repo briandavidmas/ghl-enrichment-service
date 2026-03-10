@@ -17,6 +17,7 @@ The enrichment methodology mirrors the Manus Enriched Leads Report format:
   - Online Presence Found (URLs)
   - Confidence Level (High / Medium / Low)
   - Research Notes
+  - Enrichment Status
 
 Environment Variables Required:
   OPENAI_API_KEY          : OpenAI API key (for GPT-4 research + analysis)
@@ -56,9 +57,29 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 app = FastAPI(
     title="Manus Lead Enrichment Service",
     description="AI-powered lead enrichment: receives leads from Adstra GHL, researches them, and sends enriched data to Centerfy GHL and Adstra GHL.",
-    version="2.0.0",
+    version="3.0.0",
 )
 
+
+# ---------------------------------------------------------------------------
+# GHL Custom Field Key Mapping
+# ---------------------------------------------------------------------------
+# These are the exact unique keys from the Adstra GHL Custom Fields (Contact object).
+# Format used: the key portion after "contact." — GHL inbound webhooks accept
+# both the full template tag format and the bare key name.
+#
+# Field Name                 | Unique Key
+# ---------------------------|------------------------------------------
+# Business Owner             | contact.business_owner
+# Business Name              | contact.company_name
+# Do You Have A Business?    | contact.do_you_have_a_business
+# Business Type              | contact.business_type
+# Business Location          | contact.business_location
+# Online Presence            | contact.online_precense   (note: typo in GHL)
+# Confidence Level           | contact.confidence_level
+# Research Notes             | contact.notes
+# Enrichment Status          | contact.enrichment_status
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Step 1: Web Search via Serper.dev
@@ -222,27 +243,61 @@ def _default_enrichment() -> dict:
 # ---------------------------------------------------------------------------
 def build_ghl_payload(lead_data: dict, enrichment: dict) -> dict:
     """
-    Builds the payload to send to GHL webhooks.
-    Maps enrichment fields to GHL-friendly field names.
+    Builds the payload to send to GHL inbound webhooks.
+
+    GHL inbound webhooks accept a flat JSON payload where:
+    - Standard fields use their standard names (first_name, last_name, email, phone)
+    - Custom fields use their unique key (the part after "contact." in the template tag)
+
+    Mapping of enrichment data to GHL unique field keys:
+      business_owner      -> contact.business_owner       (Business Owner field)
+      company_name        -> contact.company_name         (Business Name field)
+      do_you_have_a_business -> contact.do_you_have_a_business (Do You Have A Business?)
+      business_type       -> contact.business_type        (Business Type field)
+      business_location   -> contact.business_location    (Business Location field)
+      online_precense     -> contact.online_precense      (Online Presence — note GHL typo)
+      confidence_level    -> contact.confidence_level     (Confidence Level field)
+      notes               -> contact.notes                (Research Notes field)
+      enrichment_status   -> contact.enrichment_status    (Enrichment Status field)
     """
+    is_owner = enrichment.get("is_business_owner", False)
+    confidence = enrichment.get("confidence_level", "Low")
+
     return {
-        # --- Original Lead Fields ---
+        # --- Standard GHL Contact Fields ---
         "first_name":   lead_data.get("first_name", ""),
         "last_name":    lead_data.get("last_name", ""),
         "full_name":    lead_data.get("full_name", ""),
         "email":        lead_data.get("email", ""),
         "phone":        lead_data.get("phone", ""),
-        "lead_source":  lead_data.get("lead_source", "Meta Ad - Adstra"),
 
-        # --- Enriched Fields (matching the Manus Enriched Leads Report format) ---
-        "enriched_is_business_owner":  "Yes" if enrichment.get("is_business_owner") else "No",
-        "enriched_business_name":      enrichment.get("business_name", ""),
-        "enriched_business_type":      enrichment.get("business_type", ""),
-        "enriched_business_location":  enrichment.get("business_location", ""),
-        "enriched_online_presence":    ", ".join(enrichment.get("online_presence", [])),
-        "enriched_confidence_level":   enrichment.get("confidence_level", "Low"),
-        "enriched_research_notes":     enrichment.get("research_notes", ""),
-        "enrichment_status":           "Enriched" if enrichment.get("confidence_level") != "Low" else "Low Confidence",
+        # --- Custom Fields: use the exact unique key (after "contact.") ---
+        # Business Owner (Yes/No)
+        "business_owner":       "Yes" if is_owner else "No",
+
+        # Business Name maps to the "Business Name" field (unique key: contact.company_name)
+        "company_name":         enrichment.get("business_name", ""),
+
+        # Do You Have A Business? (Yes/No)
+        "do_you_have_a_business": "Yes" if is_owner else "No",
+
+        # Business Type / Industry
+        "business_type":        enrichment.get("business_type", ""),
+
+        # Business Location
+        "business_location":    enrichment.get("business_location", ""),
+
+        # Online Presence URLs (comma-separated) — note: GHL key has typo "precense"
+        "online_precense":      ", ".join(enrichment.get("online_presence", [])),
+
+        # Confidence Level
+        "confidence_level":     confidence,
+
+        # Research Notes (maps to contact.notes)
+        "notes":                enrichment.get("research_notes", ""),
+
+        # Enrichment Status
+        "enrichment_status":    "Enriched" if confidence in ("High", "Medium") else "Low Confidence",
     }
 
 
@@ -288,10 +343,15 @@ def run_enrichment_pipeline(lead_data: dict):
 
     # Step 2: AI analysis
     enrichment = analyze_lead_with_ai(first_name, last_name, email, phone, search_results)
-    logger.info(f"AI enrichment complete for {email} — Business Owner: {enrichment.get('is_business_owner')}, Confidence: {enrichment.get('confidence_level')}")
+    logger.info(
+        f"AI enrichment complete for {email} — "
+        f"Business Owner: {enrichment.get('is_business_owner')}, "
+        f"Confidence: {enrichment.get('confidence_level')}"
+    )
 
-    # Step 3: Build payload
+    # Step 3: Build payload with correct GHL field keys
     payload = build_ghl_payload(lead_data, enrichment)
+    logger.info(f"Payload built for {email}: {json.dumps(payload, indent=2)}")
 
     # Step 4: Send to both GHL accounts
     send_to_webhook(CENTERFY_GHL_WEBHOOK, payload, "Centerfy GHL")
@@ -303,7 +363,7 @@ def run_enrichment_pipeline(lead_data: dict):
 # ---------------------------------------------------------------------------
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "service": "Manus Lead Enrichment Service v2.0"}
+    return {"status": "ok", "service": "Manus Lead Enrichment Service v3.0"}
 
 
 @app.post("/webhook/lead")
