@@ -68,7 +68,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 app = FastAPI(
     title="Manus Lead Enrichment Service",
     description="AI-powered lead enrichment using GHL API v2 for direct contact updates.",
-    version="4.0.0",
+    version="4.1.0",
 )
 
 
@@ -121,20 +121,23 @@ def update_contact_fields(contact_id: str, enrichment: dict, api_key: str, locat
     is_owner = enrichment.get("is_business_owner", False)
     confidence = enrichment.get("confidence_level", "Low")
 
-    # Custom fields use the key format (the part after "contact.")
+    # Custom fields use the full fieldKey format (e.g. "contact.business_owner")
     custom_fields = [
-        {"key": "business_owner",        "field_value": "Yes" if is_owner else "No"},
-        {"key": "company_name",          "field_value": enrichment.get("business_name", "")},
-        {"key": "do_you_have_a_business","field_value": "Yes" if is_owner else "No"},
-        {"key": "business_type",         "field_value": enrichment.get("business_type", "")},
-        {"key": "business_location",     "field_value": enrichment.get("business_location", "")},
-        {"key": "online_precense",       "field_value": ", ".join(enrichment.get("online_presence", []))},
-        {"key": "confidence_level",      "field_value": confidence},
-        {"key": "notes",                 "field_value": enrichment.get("research_notes", "")},
-        {"key": "enrichment_status",     "field_value": "Enriched" if confidence in ("High", "Medium") else "Low Confidence"},
+        {"key": "contact.business_owner",        "field_value": "Yes" if is_owner else "No"},
+        {"key": "contact.do_you_have_a_business","field_value": "Yes" if is_owner else "No"},
+        {"key": "contact.business_type",         "field_value": enrichment.get("business_type", "")},
+        {"key": "contact.business_location",     "field_value": enrichment.get("business_location", "")},
+        {"key": "contact.online_precense",       "field_value": ", ".join(enrichment.get("online_presence", []))},
+        {"key": "contact.confidence_level",      "field_value": confidence},
+        {"key": "contact.notes",                 "field_value": enrichment.get("research_notes", "")},
+        {"key": "contact.enrichment_status",     "field_value": "Enriched" if confidence in ("High", "Medium") else "Low Confidence"},
     ]
 
-    payload = {"customFields": custom_fields}
+    # Business Name maps to the standard GHL companyName field (not a custom field)
+    payload = {
+        "companyName": enrichment.get("business_name", ""),
+        "customFields": custom_fields,
+    }
 
     try:
         response = requests.put(
@@ -175,16 +178,16 @@ def create_contact(lead_data: dict, enrichment: dict, api_key: str, location_id:
         "lastName": lead_data.get("last_name", ""),
         "email": lead_data.get("email", ""),
         "phone": lead_data.get("phone", ""),
+        "companyName": enrichment.get("business_name", ""),
         "customFields": [
-            {"key": "business_owner",        "field_value": "Yes" if is_owner else "No"},
-            {"key": "company_name",          "field_value": enrichment.get("business_name", "")},
-            {"key": "do_you_have_a_business","field_value": "Yes" if is_owner else "No"},
-            {"key": "business_type",         "field_value": enrichment.get("business_type", "")},
-            {"key": "business_location",     "field_value": enrichment.get("business_location", "")},
-            {"key": "online_precense",       "field_value": ", ".join(enrichment.get("online_presence", []))},
-            {"key": "confidence_level",      "field_value": confidence},
-            {"key": "notes",                 "field_value": enrichment.get("research_notes", "")},
-            {"key": "enrichment_status",     "field_value": "Enriched" if confidence in ("High", "Medium") else "Low Confidence"},
+            {"key": "contact.business_owner",        "field_value": "Yes" if is_owner else "No"},
+            {"key": "contact.do_you_have_a_business","field_value": "Yes" if is_owner else "No"},
+            {"key": "contact.business_type",         "field_value": enrichment.get("business_type", "")},
+            {"key": "contact.business_location",     "field_value": enrichment.get("business_location", "")},
+            {"key": "contact.online_precense",       "field_value": ", ".join(enrichment.get("online_presence", []))},
+            {"key": "contact.confidence_level",      "field_value": confidence},
+            {"key": "contact.notes",                 "field_value": enrichment.get("research_notes", "")},
+            {"key": "contact.enrichment_status",     "field_value": "Enriched" if confidence in ("High", "Medium") else "Low Confidence"},
         ],
     }
 
@@ -410,7 +413,7 @@ def run_enrichment_pipeline(lead_data: dict):
 # ---------------------------------------------------------------------------
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "service": "Manus Lead Enrichment Service v4.0"}
+    return {"status": "ok", "service": "Manus Lead Enrichment Service v4.1"}
 
 
 @app.post("/webhook/lead")
