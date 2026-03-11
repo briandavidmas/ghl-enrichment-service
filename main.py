@@ -1,32 +1,34 @@
 """
-Manus AI Lead Enrichment Service
-==================================
+Manus AI Lead Enrichment Service v4.0
+======================================
 This FastAPI service receives a lead from Adstra GHL via webhook, performs
 AI-powered web research to enrich the lead (business ownership, business name,
 industry, location, online presence, confidence level, research notes), then
-sends the enriched data back to BOTH Centerfy GHL and Adstra GHL.
+updates the contact directly via the GHL API in BOTH Centerfy GHL and Adstra GHL.
 
-The enrichment methodology mirrors the Manus Enriched Leads Report format:
-  - Full Name
-  - Email
-  - Phone
-  - Business Owner? (Yes / No)
-  - Business Name
-  - Business Type / Industry
-  - Business Location
-  - Online Presence Found (URLs)
-  - Confidence Level (High / Medium / Low)
-  - Research Notes
-  - Enrichment Status
+Using the GHL API directly (instead of inbound webhooks) ensures:
+- No duplicate contacts are created
+- No workflow loops are triggered
+- Updates are applied precisely to the correct contact
 
 Environment Variables Required:
   OPENAI_API_KEY          : OpenAI API key (for GPT-4 research + analysis)
   SERPER_API_KEY          : Serper.dev API key (for Google Search results)
-  CENTERFY_GHL_WEBHOOK    : Centerfy GHL Inbound Webhook URL
-  ADSTRA_GHL_WEBHOOK      : Adstra GHL Inbound Webhook URL (to update original contact)
+  ADSTRA_GHL_API_KEY      : Adstra GHL Private Integration API key
+  ADSTRA_GHL_LOCATION_ID  : Adstra GHL Location ID
+  CENTERFY_GHL_API_KEY    : Centerfy GHL Private Integration API key
+  CENTERFY_GHL_LOCATION_ID: Centerfy GHL Location ID
 
-Run:
-  uvicorn main:app --host 0.0.0.0 --port 8000
+GHL Custom Field IDs (Adstra):
+  business_owner          -> contact.business_owner
+  company_name            -> contact.company_name
+  do_you_have_a_business  -> contact.do_you_have_a_business
+  business_type           -> contact.business_type
+  business_location       -> contact.business_location
+  online_precense         -> contact.online_precense  (note: GHL typo)
+  confidence_level        -> contact.confidence_level
+  notes                   -> contact.notes
+  enrichment_status       -> contact.enrichment_status
 """
 
 import os
@@ -43,52 +45,177 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-OPENAI_API_KEY       = os.getenv("OPENAI_API_KEY", "")
-SERPER_API_KEY       = os.getenv("SERPER_API_KEY", "")
-CENTERFY_GHL_WEBHOOK = os.getenv("CENTERFY_GHL_WEBHOOK", "")
-ADSTRA_GHL_WEBHOOK   = os.getenv("ADSTRA_GHL_WEBHOOK", "")
+OPENAI_API_KEY            = os.getenv("OPENAI_API_KEY", "")
+SERPER_API_KEY            = os.getenv("SERPER_API_KEY", "")
+
+# Adstra GHL
+ADSTRA_GHL_API_KEY        = os.getenv("ADSTRA_GHL_API_KEY", "")
+ADSTRA_GHL_LOCATION_ID    = os.getenv("ADSTRA_GHL_LOCATION_ID", "")
+
+# Centerfy GHL
+CENTERFY_GHL_API_KEY      = os.getenv("CENTERFY_GHL_API_KEY", "")
+CENTERFY_GHL_LOCATION_ID  = os.getenv("CENTERFY_GHL_LOCATION_ID", "")
+
+# GHL API base URL
+GHL_API_BASE = "https://services.leadconnectorhq.com"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# OpenAI client — uses OPENAI_API_KEY from environment automatically
+# OpenAI client
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 app = FastAPI(
     title="Manus Lead Enrichment Service",
-    description="AI-powered lead enrichment: receives leads from Adstra GHL, researches them, and sends enriched data to Centerfy GHL and Adstra GHL.",
-    version="3.2.0",
+    description="AI-powered lead enrichment using GHL API v2 for direct contact updates.",
+    version="4.0.0",
 )
 
 
 # ---------------------------------------------------------------------------
-# GHL Custom Field Key Mapping
+# GHL API: Find contact by email
 # ---------------------------------------------------------------------------
-# These are the exact unique keys from the Adstra GHL Custom Fields (Contact object).
-# Format used: the key portion after "contact." — GHL inbound webhooks accept
-# both the full template tag format and the bare key name.
-#
-# Field Name                 | Unique Key
-# ---------------------------|------------------------------------------
-# Business Owner             | contact.business_owner
-# Business Name              | contact.company_name
-# Do You Have A Business?    | contact.do_you_have_a_business
-# Business Type              | contact.business_type
-# Business Location          | contact.business_location
-# Online Presence            | contact.online_precense   (note: typo in GHL)
-# Confidence Level           | contact.confidence_level
-# Research Notes             | contact.notes
-# Enrichment Status          | contact.enrichment_status
+def find_contact_by_email(email: str, api_key: str, location_id: str) -> str | None:
+    """
+    Searches for a contact by email in a GHL location.
+    Returns the contact ID if found, or None.
+    """
+    if not api_key or not location_id:
+        logger.warning("GHL API key or location ID not configured.")
+        return None
+    try:
+        response = requests.get(
+            f"{GHL_API_BASE}/contacts/search/duplicate",
+            params={"locationId": location_id, "email": email},
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Version": "2021-07-28",
+                "Content-Type": "application/json",
+            },
+            timeout=15,
+        )
+        if response.status_code == 200:
+            data = response.json()
+            contact = data.get("contact")
+            if contact:
+                return contact.get("id")
+        logger.warning(f"Contact not found for email {email} — status {response.status_code}")
+        return None
+    except Exception as e:
+        logger.error(f"Error searching for contact: {e}")
+        return None
+
+
 # ---------------------------------------------------------------------------
+# GHL API: Update contact custom fields
+# ---------------------------------------------------------------------------
+def update_contact_fields(contact_id: str, enrichment: dict, api_key: str, location_id: str, destination: str) -> bool:
+    """
+    Updates a GHL contact's custom fields using the GHL API v2.
+    Uses the customFields array format for custom fields.
+    """
+    if not api_key or not location_id or not contact_id:
+        logger.warning(f"{destination}: Missing API key, location ID, or contact ID — skipping.")
+        return False
+
+    is_owner = enrichment.get("is_business_owner", False)
+    confidence = enrichment.get("confidence_level", "Low")
+
+    # Custom fields use the key format (the part after "contact.")
+    custom_fields = [
+        {"key": "business_owner",        "field_value": "Yes" if is_owner else "No"},
+        {"key": "company_name",          "field_value": enrichment.get("business_name", "")},
+        {"key": "do_you_have_a_business","field_value": "Yes" if is_owner else "No"},
+        {"key": "business_type",         "field_value": enrichment.get("business_type", "")},
+        {"key": "business_location",     "field_value": enrichment.get("business_location", "")},
+        {"key": "online_precense",       "field_value": ", ".join(enrichment.get("online_presence", []))},
+        {"key": "confidence_level",      "field_value": confidence},
+        {"key": "notes",                 "field_value": enrichment.get("research_notes", "")},
+        {"key": "enrichment_status",     "field_value": "Enriched" if confidence in ("High", "Medium") else "Low Confidence"},
+    ]
+
+    payload = {"customFields": custom_fields}
+
+    try:
+        response = requests.put(
+            f"{GHL_API_BASE}/contacts/{contact_id}",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Version": "2021-07-28",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=15,
+        )
+        if response.status_code in (200, 201):
+            logger.info(f"Successfully updated contact {contact_id} in {destination}")
+            return True
+        else:
+            logger.error(f"{destination} API update error {response.status_code}: {response.text}")
+            return False
+    except Exception as e:
+        logger.error(f"Failed to update contact in {destination}: {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# GHL API: Create contact if not found
+# ---------------------------------------------------------------------------
+def create_contact(lead_data: dict, enrichment: dict, api_key: str, location_id: str, destination: str) -> str | None:
+    """
+    Creates a new contact in GHL with enrichment data pre-populated.
+    Returns the new contact ID or None.
+    """
+    is_owner = enrichment.get("is_business_owner", False)
+    confidence = enrichment.get("confidence_level", "Low")
+
+    payload = {
+        "locationId": location_id,
+        "firstName": lead_data.get("first_name", ""),
+        "lastName": lead_data.get("last_name", ""),
+        "email": lead_data.get("email", ""),
+        "phone": lead_data.get("phone", ""),
+        "customFields": [
+            {"key": "business_owner",        "field_value": "Yes" if is_owner else "No"},
+            {"key": "company_name",          "field_value": enrichment.get("business_name", "")},
+            {"key": "do_you_have_a_business","field_value": "Yes" if is_owner else "No"},
+            {"key": "business_type",         "field_value": enrichment.get("business_type", "")},
+            {"key": "business_location",     "field_value": enrichment.get("business_location", "")},
+            {"key": "online_precense",       "field_value": ", ".join(enrichment.get("online_presence", []))},
+            {"key": "confidence_level",      "field_value": confidence},
+            {"key": "notes",                 "field_value": enrichment.get("research_notes", "")},
+            {"key": "enrichment_status",     "field_value": "Enriched" if confidence in ("High", "Medium") else "Low Confidence"},
+        ],
+    }
+
+    try:
+        response = requests.post(
+            f"{GHL_API_BASE}/contacts/",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Version": "2021-07-28",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=15,
+        )
+        if response.status_code in (200, 201):
+            data = response.json()
+            contact_id = data.get("contact", {}).get("id")
+            logger.info(f"Created new contact {contact_id} in {destination}")
+            return contact_id
+        else:
+            logger.error(f"{destination} create contact error {response.status_code}: {response.text}")
+            return None
+    except Exception as e:
+        logger.error(f"Failed to create contact in {destination}: {e}")
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Step 1: Web Search via Serper.dev
 # ---------------------------------------------------------------------------
 def web_search(query: str, num_results: int = 5) -> list[dict]:
-    """
-    Performs a Google search via the Serper.dev API and returns a list of results.
-    Each result contains: title, link, snippet.
-    """
     if not SERPER_API_KEY:
         logger.warning("SERPER_API_KEY not set — skipping web search.")
         return []
@@ -101,14 +228,10 @@ def web_search(query: str, num_results: int = 5) -> list[dict]:
         )
         if response.status_code == 200:
             data = response.json()
-            results = []
-            for item in data.get("organic", []):
-                results.append({
-                    "title": item.get("title", ""),
-                    "link": item.get("link", ""),
-                    "snippet": item.get("snippet", ""),
-                })
-            return results
+            return [
+                {"title": item.get("title", ""), "link": item.get("link", ""), "snippet": item.get("snippet", "")}
+                for item in data.get("organic", [])
+            ]
         else:
             logger.error(f"Serper search error {response.status_code}: {response.text}")
             return []
@@ -118,10 +241,6 @@ def web_search(query: str, num_results: int = 5) -> list[dict]:
 
 
 def gather_search_results(first_name: str, last_name: str, email: str, phone: str) -> str:
-    """
-    Runs multiple targeted searches for the lead and compiles all results
-    into a single text block for the AI to analyze.
-    """
     full_name = f"{first_name} {last_name}".strip()
     email_prefix = email.split("@")[0] if "@" in email else ""
 
@@ -138,8 +257,7 @@ def gather_search_results(first_name: str, last_name: str, email: str, phone: st
     all_results = []
     seen_links = set()
     for query in queries:
-        results = web_search(query, num_results=4)
-        for r in results:
+        for r in web_search(query, num_results=4):
             if r["link"] not in seen_links:
                 seen_links.add(r["link"])
                 all_results.append(r)
@@ -147,11 +265,10 @@ def gather_search_results(first_name: str, last_name: str, email: str, phone: st
     if not all_results:
         return "No search results found."
 
-    compiled = []
-    for r in all_results:
-        compiled.append(f"Title: {r['title']}\nURL: {r['link']}\nSnippet: {r['snippet']}\n")
-
-    return "\n".join(compiled)
+    return "\n".join(
+        f"Title: {r['title']}\nURL: {r['link']}\nSnippet: {r['snippet']}\n"
+        for r in all_results
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -183,12 +300,9 @@ Guidelines:
 - If no business is found, set business_name, business_type, business_location to empty strings and online_presence to [].
 """
 
-def analyze_lead_with_ai(first_name: str, last_name: str, email: str, phone: str, search_results: str) -> dict:
-    """
-    Sends the search results to GPT-4 for analysis and returns a structured enrichment dict.
-    """
-    full_name = f"{first_name} {last_name}".strip()
 
+def analyze_lead_with_ai(first_name: str, last_name: str, email: str, phone: str, search_results: str) -> dict:
+    full_name = f"{first_name} {last_name}".strip()
     user_message = f"""Lead Information:
 - Full Name: {full_name}
 - Email: {email}
@@ -211,13 +325,11 @@ Return your findings as a JSON object exactly as specified."""
             max_tokens=800,
         )
         raw = response.choices[0].message.content.strip()
-        # Strip markdown code fences if present
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):
                 raw = raw[4:]
-        result = json.loads(raw)
-        return result
+        return json.loads(raw)
     except json.JSONDecodeError as e:
         logger.error(f"AI returned invalid JSON: {e}")
         return _default_enrichment()
@@ -239,82 +351,22 @@ def _default_enrichment() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Step 3: Send Enriched Data to GHL Webhooks
+# Step 3: Update contacts via GHL API
 # ---------------------------------------------------------------------------
-def build_ghl_payload(lead_data: dict, enrichment: dict) -> dict:
+def update_ghl_contact(email: str, lead_data: dict, enrichment: dict, api_key: str, location_id: str, destination: str):
     """
-    Builds the payload to send to GHL inbound webhooks.
-
-    GHL inbound webhooks accept a flat JSON payload where:
-    - Standard fields use their standard names (first_name, last_name, email, phone)
-    - Custom fields use their unique key (the part after "contact." in the template tag)
-
-    Mapping of enrichment data to GHL unique field keys:
-      business_owner      -> contact.business_owner       (Business Owner field)
-      company_name        -> contact.company_name         (Business Name field)
-      do_you_have_a_business -> contact.do_you_have_a_business (Do You Have A Business?)
-      business_type       -> contact.business_type        (Business Type field)
-      business_location   -> contact.business_location    (Business Location field)
-      online_precense     -> contact.online_precense      (Online Presence — note GHL typo)
-      confidence_level    -> contact.confidence_level     (Confidence Level field)
-      notes               -> contact.notes                (Research Notes field)
-      enrichment_status   -> contact.enrichment_status    (Enrichment Status field)
+    Finds the contact by email and updates their custom fields via GHL API.
+    If not found, creates the contact with enrichment data.
     """
-    is_owner = enrichment.get("is_business_owner", False)
-    confidence = enrichment.get("confidence_level", "Low")
+    logger.info(f"Looking up contact in {destination} for email: {email}")
+    contact_id = find_contact_by_email(email, api_key, location_id)
 
-    return {
-        # --- Contact Identifier ---
-        # Only send email to identify the existing contact. Sending name/phone
-        # fields causes GHL to create duplicate contacts instead of updating.
-        "email":        lead_data.get("email", ""),
-
-        # --- Custom Fields: use the exact unique key (after "contact.") ---
-        # Business Owner (Yes/No)
-        "business_owner":       "Yes" if is_owner else "No",
-
-        # Business Name maps to the "Business Name" field (unique key: contact.company_name)
-        "company_name":         enrichment.get("business_name", ""),
-
-        # Do You Have A Business? (Yes/No)
-        "do_you_have_a_business": "Yes" if is_owner else "No",
-
-        # Business Type / Industry
-        "business_type":        enrichment.get("business_type", ""),
-
-        # Business Location
-        "business_location":    enrichment.get("business_location", ""),
-
-        # Online Presence URLs (comma-separated) — note: GHL key has typo "precense"
-        "online_precense":      ", ".join(enrichment.get("online_presence", [])),
-
-        # Confidence Level
-        "confidence_level":     confidence,
-
-        # Research Notes (maps to contact.notes)
-        "notes":                enrichment.get("research_notes", ""),
-
-        # Enrichment Status
-        "enrichment_status":    "Enriched" if confidence in ("High", "Medium") else "Low Confidence",
-    }
-
-
-def send_to_webhook(url: str, payload: dict, destination: str) -> bool:
-    """Sends a JSON payload to a GHL inbound webhook URL."""
-    if not url:
-        logger.warning(f"{destination} webhook URL not configured — skipping.")
-        return False
-    try:
-        response = requests.post(url, json=payload, timeout=15)
-        if response.status_code in (200, 201, 202):
-            logger.info(f"Successfully sent enriched data to {destination}")
-            return True
-        else:
-            logger.error(f"{destination} webhook error {response.status_code}: {response.text}")
-            return False
-    except Exception as e:
-        logger.error(f"Failed to send to {destination}: {e}")
-        return False
+    if contact_id:
+        logger.info(f"Found contact {contact_id} in {destination} — updating fields")
+        update_contact_fields(contact_id, enrichment, api_key, location_id, destination)
+    else:
+        logger.info(f"Contact not found in {destination} — creating new contact")
+        create_contact(lead_data, enrichment, api_key, location_id, destination)
 
 
 # ---------------------------------------------------------------------------
@@ -325,8 +377,8 @@ def run_enrichment_pipeline(lead_data: dict):
     Orchestrates the full enrichment pipeline:
     1. Gather web search results for the lead
     2. Analyze with AI to produce structured enrichment
-    3. Send enriched data to Centerfy GHL
-    4. Send enriched data back to Adstra GHL
+    3. Update contact in Adstra GHL via API
+    4. Update contact in Centerfy GHL via API
     """
     email      = lead_data.get("email", "")
     first_name = lead_data.get("first_name", "")
@@ -346,14 +398,11 @@ def run_enrichment_pipeline(lead_data: dict):
         f"Business Owner: {enrichment.get('is_business_owner')}, "
         f"Confidence: {enrichment.get('confidence_level')}"
     )
+    logger.info(f"Enrichment data: {json.dumps(enrichment, indent=2)}")
 
-    # Step 3: Build payload with correct GHL field keys
-    payload = build_ghl_payload(lead_data, enrichment)
-    logger.info(f"Payload built for {email}: {json.dumps(payload, indent=2)}")
-
-    # Step 4: Send to both GHL accounts
-    send_to_webhook(CENTERFY_GHL_WEBHOOK, payload, "Centerfy GHL")
-    send_to_webhook(ADSTRA_GHL_WEBHOOK,   payload, "Adstra GHL")
+    # Step 3: Update both GHL accounts via API
+    update_ghl_contact(email, lead_data, enrichment, ADSTRA_GHL_API_KEY,   ADSTRA_GHL_LOCATION_ID,   "Adstra GHL")
+    update_ghl_contact(email, lead_data, enrichment, CENTERFY_GHL_API_KEY, CENTERFY_GHL_LOCATION_ID, "Centerfy GHL")
 
 
 # ---------------------------------------------------------------------------
@@ -361,7 +410,7 @@ def run_enrichment_pipeline(lead_data: dict):
 # ---------------------------------------------------------------------------
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "service": "Manus Lead Enrichment Service v3.0"}
+    return {"status": "ok", "service": "Manus Lead Enrichment Service v4.0"}
 
 
 @app.post("/webhook/lead")
@@ -371,7 +420,7 @@ async def receive_lead_webhook(request: Request, background_tasks: BackgroundTas
     Immediately returns 200 OK, then processes enrichment in the background.
 
     Expected GHL webhook payload fields:
-      first_name, last_name, full_name, email, phone
+      first_name, last_name, email, phone
     """
     try:
         body = await request.json()
@@ -383,10 +432,8 @@ async def receive_lead_webhook(request: Request, background_tasks: BackgroundTas
     lead_data = {
         "first_name":  body.get("first_name")  or contact.get("first_name", ""),
         "last_name":   body.get("last_name")   or contact.get("last_name", ""),
-        "full_name":   body.get("full_name")   or contact.get("full_name", ""),
         "email":       body.get("email")       or contact.get("email", ""),
         "phone":       body.get("phone")       or contact.get("phone", ""),
-        "lead_source": body.get("lead_source", "Meta Ad - Adstra"),
     }
 
     if not lead_data["email"] and not lead_data["phone"]:
