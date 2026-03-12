@@ -20,15 +20,23 @@ Environment Variables Required:
   CENTERFY_GHL_LOCATION_ID: Centerfy GHL Location ID
 
 GHL Custom Field IDs (Adstra):
-  business_owner          -> contact.business_owner
-  company_name            -> contact.company_name
-  do_you_have_a_business  -> contact.do_you_have_a_business
-  business_type           -> contact.business_type
-  business_location       -> contact.business_location
-  online_precense         -> contact.online_precense  (note: GHL typo)
-  confidence_level        -> contact.confidence_level
-  notes                   -> contact.notes
-  enrichment_status       -> contact.enrichment_status
+  Business Owner          -> IHwhvNck7VKt0kWCDWNG
+  Do You Have A Business  -> ddB1BCcaF35uUPDUprl9
+  Business Type           -> OCjEBvvuZ7l4mKFQ0vd3
+  Business Location       -> PIKRq4AWFLLXoZGEjUjG
+  Online Presence         -> (key: contact.online_precense — typo in GHL)
+  Confidence Level        -> RmeWNiUf3ctR5xCW9kSv
+  Research Notes          -> e2Jab0wmokCZ3NMe5vxw
+  Enrichment Status       -> HgLW92yemMLxNpKUWg4d
+
+GHL Custom Field IDs (Centerfy):
+  Business Owner          -> aVVjRt3h86fKSlQvkva8
+  Business Type           -> NTVcL8yhL9BHtJAexNOf
+  Business Location       -> 2ZMMey5prTjWBVGByWmx
+  Online Presence         -> xhqfimig2Z3plQ6P4Lh0
+  Confidence Level        -> p9h423CxRjv07YgNZQJ9
+  Research Notes          -> 0c6xWsEzOMZvtMlDisHL
+  Enrichment Status       -> 1lko4IzWhrz6qBRbGNe2
 """
 
 import os
@@ -65,10 +73,37 @@ logger = logging.getLogger(__name__)
 # OpenAI client
 client = OpenAI(api_key=OPENAI_API_KEY)
 
+# ---------------------------------------------------------------------------
+# GHL Custom Field ID Maps (field IDs are required for PUT /contacts/{id})
+# ---------------------------------------------------------------------------
+# Adstra GHL field IDs
+ADSTRA_FIELD_IDS = {
+    "business_owner":        "IHwhvNck7VKt0kWCDWNG",
+    "do_you_have_a_business":"ddB1BCcaF35uUPDUprl9",
+    "business_type":         "OCjEBvvuZ7l4mKFQ0vd3",
+    "business_location":     "PIKRq4AWFLLXoZGEjUjG",
+    "online_presence":       "online_precense_key",   # uses key fallback (see below)
+    "confidence_level":      "RmeWNiUf3ctR5xCW9kSv",
+    "research_notes":        "e2Jab0wmokCZ3NMe5vxw",
+    "enrichment_status":     "HgLW92yemMLxNpKUWg4d",
+}
+
+# Centerfy GHL field IDs
+CENTERFY_FIELD_IDS = {
+    "business_owner":        "aVVjRt3h86fKSlQvkva8",
+    "do_you_have_a_business": None,   # not present in Centerfy
+    "business_type":         "NTVcL8yhL9BHtJAexNOf",
+    "business_location":     "2ZMMey5prTjWBVGByWmx",
+    "online_presence":       "xhqfimig2Z3plQ6P4Lh0",
+    "confidence_level":      "p9h423CxRjv07YgNZQJ9",
+    "research_notes":        "0c6xWsEzOMZvtMlDisHL",
+    "enrichment_status":     "1lko4IzWhrz6qBRbGNe2",
+}
+
 app = FastAPI(
     title="Manus Lead Enrichment Service",
     description="AI-powered lead enrichment using GHL API v2 for direct contact updates.",
-    version="4.1.0",
+    version="4.2.0",
 )
 
 
@@ -120,18 +155,31 @@ def update_contact_fields(contact_id: str, enrichment: dict, api_key: str, locat
 
     is_owner = enrichment.get("is_business_owner", False)
     confidence = enrichment.get("confidence_level", "Low")
+    enrichment_status = "Enriched" if confidence in ("High", "Medium") else "Low Confidence"
+    online_presence_str = ", ".join(enrichment.get("online_presence", []))
 
-    # Custom fields use the full fieldKey format (e.g. "contact.business_owner")
-    custom_fields = [
-        {"key": "contact.business_owner",        "field_value": "Yes" if is_owner else "No"},
-        {"key": "contact.do_you_have_a_business","field_value": "Yes" if is_owner else "No"},
-        {"key": "contact.business_type",         "field_value": enrichment.get("business_type", "")},
-        {"key": "contact.business_location",     "field_value": enrichment.get("business_location", "")},
-        {"key": "contact.online_precense",       "field_value": ", ".join(enrichment.get("online_presence", []))},
-        {"key": "contact.confidence_level",      "field_value": confidence},
-        {"key": "contact.notes",                 "field_value": enrichment.get("research_notes", "")},
-        {"key": "contact.enrichment_status",     "field_value": "Enriched" if confidence in ("High", "Medium") else "Low Confidence"},
-    ]
+    # Select the correct field ID map based on destination
+    field_ids = ADSTRA_FIELD_IDS if destination == "Adstra GHL" else CENTERFY_FIELD_IDS
+
+    # Build custom fields list using field IDs (required for PUT /contacts/{id})
+    custom_fields = []
+    field_values = {
+        "business_owner":        "Yes" if is_owner else "No",
+        "do_you_have_a_business":"Yes" if is_owner else "No",
+        "business_type":         enrichment.get("business_type", ""),
+        "business_location":     enrichment.get("business_location", ""),
+        "online_presence":       online_presence_str,
+        "confidence_level":      confidence,
+        "research_notes":        enrichment.get("research_notes", ""),
+        "enrichment_status":     enrichment_status,
+    }
+    for field_name, field_id in field_ids.items():
+        if field_id and field_id != "online_precense_key" and field_name in field_values:
+            custom_fields.append({"id": field_id, "field_value": field_values[field_name]})
+
+    # Adstra has a typo in the online presence field key — use key fallback
+    if destination == "Adstra GHL":
+        custom_fields.append({"key": "contact.online_precense", "field_value": online_presence_str})
 
     # Business Name maps to the standard GHL companyName field (not a custom field)
     payload = {
@@ -185,8 +233,10 @@ def create_contact(lead_data: dict, enrichment: dict, api_key: str, location_id:
             {"key": "contact.business_type",         "field_value": enrichment.get("business_type", "")},
             {"key": "contact.business_location",     "field_value": enrichment.get("business_location", "")},
             {"key": "contact.online_precense",       "field_value": ", ".join(enrichment.get("online_presence", []))},
+            {"key": "contact.online_presence",       "field_value": ", ".join(enrichment.get("online_presence", []))},
             {"key": "contact.confidence_level",      "field_value": confidence},
             {"key": "contact.notes",                 "field_value": enrichment.get("research_notes", "")},
+            {"key": "contact.research_notes",        "field_value": enrichment.get("research_notes", "")},
             {"key": "contact.enrichment_status",     "field_value": "Enriched" if confidence in ("High", "Medium") else "Low Confidence"},
         ],
     }
@@ -413,7 +463,7 @@ def run_enrichment_pipeline(lead_data: dict):
 # ---------------------------------------------------------------------------
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "service": "Manus Lead Enrichment Service v4.1"}
+    return {"status": "ok", "service": "Manus Lead Enrichment Service v4.2"}
 
 
 @app.post("/webhook/lead")
