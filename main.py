@@ -1,5 +1,5 @@
 """
-Manus AI Lead Enrichment Service v4.0
+Manus AI Lead Enrichment Service v4.3
 ======================================
 This FastAPI service receives a lead from Adstra GHL via webhook, performs
 AI-powered web research to enrich the lead (business ownership, business name,
@@ -10,6 +10,13 @@ Using the GHL API directly (instead of inbound webhooks) ensures:
 - No duplicate contacts are created
 - No workflow loops are triggered
 - Updates are applied precisely to the correct contact
+
+v4.3 Changes:
+- Phone number fallback lookup when email lookup fails
+- Never overwrite companyName with empty string
+- Never overwrite existing contact email/phone
+- Adstra: create contact if not found (new Meta lead)
+- Centerfy: only update existing contacts, never create (contacts sync from Adstra)
 
 Environment Variables Required:
   OPENAI_API_KEY          : OpenAI API key (for GPT-4 research + analysis)
@@ -103,7 +110,7 @@ CENTERFY_FIELD_IDS = {
 app = FastAPI(
     title="Manus Lead Enrichment Service",
     description="AI-powered lead enrichment using GHL API v2 for direct contact updates.",
-    version="4.2.0",
+    version="4.3.0",
 )
 
 
@@ -112,11 +119,10 @@ app = FastAPI(
 # ---------------------------------------------------------------------------
 def find_contact_by_email(email: str, api_key: str, location_id: str) -> str | None:
     """
-    Searches for a contact by email in a GHL location.
+    Searches for a contact by email in a GHL location using the duplicate-check endpoint.
     Returns the contact ID if found, or None.
     """
-    if not api_key or not location_id:
-        logger.warning("GHL API key or location ID not configured.")
+    if not email or not api_key or not location_id:
         return None
     try:
         response = requests.get(
@@ -133,12 +139,61 @@ def find_contact_by_email(email: str, api_key: str, location_id: str) -> str | N
             data = response.json()
             contact = data.get("contact")
             if contact:
+                logger.info(f"Found contact by email: {contact.get('id')}")
                 return contact.get("id")
-        logger.warning(f"Contact not found for email {email} — status {response.status_code}")
         return None
     except Exception as e:
-        logger.error(f"Error searching for contact: {e}")
+        logger.error(f"Error searching contact by email: {e}")
         return None
+
+
+# ---------------------------------------------------------------------------
+# GHL API: Find contact by phone
+# ---------------------------------------------------------------------------
+def find_contact_by_phone(phone: str, api_key: str, location_id: str) -> str | None:
+    """
+    Searches for a contact by phone number in a GHL location.
+    Returns the contact ID if found, or None.
+    """
+    if not phone or not api_key or not location_id:
+        return None
+    try:
+        response = requests.get(
+            f"{GHL_API_BASE}/contacts/search/duplicate",
+            params={"locationId": location_id, "phone": phone},
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Version": "2021-07-28",
+                "Content-Type": "application/json",
+            },
+            timeout=15,
+        )
+        if response.status_code == 200:
+            data = response.json()
+            contact = data.get("contact")
+            if contact:
+                logger.info(f"Found contact by phone: {contact.get('id')}")
+                return contact.get("id")
+        return None
+    except Exception as e:
+        logger.error(f"Error searching contact by phone: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# GHL API: Find contact by email OR phone (with fallback)
+# ---------------------------------------------------------------------------
+def find_contact(email: str, phone: str, api_key: str, location_id: str) -> str | None:
+    """
+    Tries to find a contact by email first, then falls back to phone.
+    Returns the contact ID if found, or None.
+    """
+    contact_id = find_contact_by_email(email, api_key, location_id)
+    if contact_id:
+        return contact_id
+    logger.info(f"Email lookup failed — trying phone fallback for {phone}")
+    contact_id = find_contact_by_phone(phone, api_key, location_id)
+    return contact_id
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +202,8 @@ def find_contact_by_email(email: str, api_key: str, location_id: str) -> str | N
 def update_contact_fields(contact_id: str, enrichment: dict, api_key: str, location_id: str, destination: str) -> bool:
     """
     Updates a GHL contact's custom fields using the GHL API v2.
-    Uses the customFields array format for custom fields.
+    Uses the customFields array format with field IDs.
+    NEVER overwrites email, phone, or companyName with empty values.
     """
     if not api_key or not location_id or not contact_id:
         logger.warning(f"{destination}: Missing API key, location ID, or contact ID — skipping.")
@@ -157,6 +213,7 @@ def update_contact_fields(contact_id: str, enrichment: dict, api_key: str, locat
     confidence = enrichment.get("confidence_level", "Low")
     enrichment_status = "Enriched" if confidence in ("High", "Medium") else "Low Confidence"
     online_presence_str = ", ".join(enrichment.get("online_presence", []))
+    business_name = enrichment.get("business_name", "").strip()
 
     # Select the correct field ID map based on destination
     field_ids = ADSTRA_FIELD_IDS if destination == "Adstra GHL" else CENTERFY_FIELD_IDS
@@ -181,11 +238,10 @@ def update_contact_fields(contact_id: str, enrichment: dict, api_key: str, locat
     if destination == "Adstra GHL":
         custom_fields.append({"key": "contact.online_precense", "field_value": online_presence_str})
 
-    # Business Name maps to the standard GHL companyName field (not a custom field)
-    payload = {
-        "companyName": enrichment.get("business_name", ""),
-        "customFields": custom_fields,
-    }
+    # Build payload — only include companyName if AI found a real business name
+    payload = {"customFields": custom_fields}
+    if business_name:
+        payload["companyName"] = business_name
 
     try:
         response = requests.put(
@@ -210,42 +266,43 @@ def update_contact_fields(contact_id: str, enrichment: dict, api_key: str, locat
 
 
 # ---------------------------------------------------------------------------
-# GHL API: Create contact if not found
+# GHL API: Create contact in Adstra only (if not found)
 # ---------------------------------------------------------------------------
-def create_contact(lead_data: dict, enrichment: dict, api_key: str, location_id: str, destination: str) -> str | None:
+def create_contact_adstra(lead_data: dict, enrichment: dict) -> str | None:
     """
-    Creates a new contact in GHL with enrichment data pre-populated.
+    Creates a new contact in Adstra GHL with enrichment data pre-populated.
+    Only used for Adstra — Centerfy contacts are synced from Adstra, not created directly.
     Returns the new contact ID or None.
     """
     is_owner = enrichment.get("is_business_owner", False)
     confidence = enrichment.get("confidence_level", "Low")
+    business_name = enrichment.get("business_name", "").strip()
 
     payload = {
-        "locationId": location_id,
+        "locationId": ADSTRA_GHL_LOCATION_ID,
         "firstName": lead_data.get("first_name", ""),
         "lastName": lead_data.get("last_name", ""),
         "email": lead_data.get("email", ""),
         "phone": lead_data.get("phone", ""),
-        "companyName": enrichment.get("business_name", ""),
         "customFields": [
-            {"key": "contact.business_owner",        "field_value": "Yes" if is_owner else "No"},
-            {"key": "contact.do_you_have_a_business","field_value": "Yes" if is_owner else "No"},
-            {"key": "contact.business_type",         "field_value": enrichment.get("business_type", "")},
-            {"key": "contact.business_location",     "field_value": enrichment.get("business_location", "")},
-            {"key": "contact.online_precense",       "field_value": ", ".join(enrichment.get("online_presence", []))},
-            {"key": "contact.online_presence",       "field_value": ", ".join(enrichment.get("online_presence", []))},
-            {"key": "contact.confidence_level",      "field_value": confidence},
-            {"key": "contact.notes",                 "field_value": enrichment.get("research_notes", "")},
-            {"key": "contact.research_notes",        "field_value": enrichment.get("research_notes", "")},
-            {"key": "contact.enrichment_status",     "field_value": "Enriched" if confidence in ("High", "Medium") else "Low Confidence"},
+            {"id": "IHwhvNck7VKt0kWCDWNG", "field_value": "Yes" if is_owner else "No"},
+            {"id": "ddB1BCcaF35uUPDUprl9", "field_value": "Yes" if is_owner else "No"},
+            {"id": "OCjEBvvuZ7l4mKFQ0vd3", "field_value": enrichment.get("business_type", "")},
+            {"id": "PIKRq4AWFLLXoZGEjUjG", "field_value": enrichment.get("business_location", "")},
+            {"key": "contact.online_precense", "field_value": ", ".join(enrichment.get("online_presence", []))},
+            {"id": "RmeWNiUf3ctR5xCW9kSv", "field_value": confidence},
+            {"id": "e2Jab0wmokCZ3NMe5vxw", "field_value": enrichment.get("research_notes", "")},
+            {"id": "HgLW92yemMLxNpKUWg4d", "field_value": "Enriched" if confidence in ("High", "Medium") else "Low Confidence"},
         ],
     }
+    if business_name:
+        payload["companyName"] = business_name
 
     try:
         response = requests.post(
             f"{GHL_API_BASE}/contacts/",
             headers={
-                "Authorization": f"Bearer {api_key}",
+                "Authorization": f"Bearer {ADSTRA_GHL_API_KEY}",
                 "Version": "2021-07-28",
                 "Content-Type": "application/json",
             },
@@ -255,13 +312,13 @@ def create_contact(lead_data: dict, enrichment: dict, api_key: str, location_id:
         if response.status_code in (200, 201):
             data = response.json()
             contact_id = data.get("contact", {}).get("id")
-            logger.info(f"Created new contact {contact_id} in {destination}")
+            logger.info(f"Created new contact {contact_id} in Adstra GHL")
             return contact_id
         else:
-            logger.error(f"{destination} create contact error {response.status_code}: {response.text}")
+            logger.error(f"Adstra create contact error {response.status_code}: {response.text}")
             return None
     except Exception as e:
-        logger.error(f"Failed to create contact in {destination}: {e}")
+        logger.error(f"Failed to create contact in Adstra GHL: {e}")
         return None
 
 
@@ -406,20 +463,22 @@ def _default_enrichment() -> dict:
 # ---------------------------------------------------------------------------
 # Step 3: Update contacts via GHL API
 # ---------------------------------------------------------------------------
-def update_ghl_contact(email: str, lead_data: dict, enrichment: dict, api_key: str, location_id: str, destination: str):
+def update_ghl_contact(email: str, phone: str, lead_data: dict, enrichment: dict, api_key: str, location_id: str, destination: str, create_if_missing: bool = False):
     """
-    Finds the contact by email and updates their custom fields via GHL API.
-    If not found, creates the contact with enrichment data.
+    Finds the contact by email (then phone as fallback) and updates their custom fields.
+    If create_if_missing is True and contact not found, creates a new contact (Adstra only).
     """
-    logger.info(f"Looking up contact in {destination} for email: {email}")
-    contact_id = find_contact_by_email(email, api_key, location_id)
+    logger.info(f"Looking up contact in {destination} — email: {email}, phone: {phone}")
+    contact_id = find_contact(email, phone, api_key, location_id)
 
     if contact_id:
         logger.info(f"Found contact {contact_id} in {destination} — updating fields")
         update_contact_fields(contact_id, enrichment, api_key, location_id, destination)
-    else:
+    elif create_if_missing:
         logger.info(f"Contact not found in {destination} — creating new contact")
-        create_contact(lead_data, enrichment, api_key, location_id, destination)
+        create_contact_adstra(lead_data, enrichment)
+    else:
+        logger.warning(f"Contact not found in {destination} — skipping (no creation for this account)")
 
 
 # ---------------------------------------------------------------------------
@@ -430,8 +489,8 @@ def run_enrichment_pipeline(lead_data: dict):
     Orchestrates the full enrichment pipeline:
     1. Gather web search results for the lead
     2. Analyze with AI to produce structured enrichment
-    3. Update contact in Adstra GHL via API
-    4. Update contact in Centerfy GHL via API
+    3. Update contact in Adstra GHL via API (create if not found)
+    4. Update contact in Centerfy GHL via API (update only, never create)
     """
     email      = lead_data.get("email", "")
     first_name = lead_data.get("first_name", "")
@@ -453,9 +512,19 @@ def run_enrichment_pipeline(lead_data: dict):
     )
     logger.info(f"Enrichment data: {json.dumps(enrichment, indent=2)}")
 
-    # Step 3: Update both GHL accounts via API
-    update_ghl_contact(email, lead_data, enrichment, ADSTRA_GHL_API_KEY,   ADSTRA_GHL_LOCATION_ID,   "Adstra GHL")
-    update_ghl_contact(email, lead_data, enrichment, CENTERFY_GHL_API_KEY, CENTERFY_GHL_LOCATION_ID, "Centerfy GHL")
+    # Step 3: Update Adstra GHL (create if not found — this is the source account for Meta leads)
+    update_ghl_contact(
+        email, phone, lead_data, enrichment,
+        ADSTRA_GHL_API_KEY, ADSTRA_GHL_LOCATION_ID, "Adstra GHL",
+        create_if_missing=True
+    )
+
+    # Step 4: Update Centerfy GHL (update only — contacts sync from Adstra, never create here)
+    update_ghl_contact(
+        email, phone, lead_data, enrichment,
+        CENTERFY_GHL_API_KEY, CENTERFY_GHL_LOCATION_ID, "Centerfy GHL",
+        create_if_missing=False
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -463,7 +532,7 @@ def run_enrichment_pipeline(lead_data: dict):
 # ---------------------------------------------------------------------------
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "service": "Manus Lead Enrichment Service v4.2"}
+    return {"status": "ok", "service": "Manus Lead Enrichment Service v4.3"}
 
 
 @app.post("/webhook/lead")
@@ -471,7 +540,6 @@ async def receive_lead_webhook(request: Request, background_tasks: BackgroundTas
     """
     Receives a lead from Adstra GHL via outbound webhook.
     Immediately returns 200 OK, then processes enrichment in the background.
-
     Expected GHL webhook payload fields:
       first_name, last_name, email, phone
     """
@@ -497,7 +565,6 @@ async def receive_lead_webhook(request: Request, background_tasks: BackgroundTas
 
     background_tasks.add_task(run_enrichment_pipeline, lead_data)
     logger.info(f"Lead received and queued: {lead_data.get('email') or lead_data.get('phone')}")
-
     return JSONResponse(
         status_code=200,
         content={"status": "received", "message": "Lead queued for enrichment."},
