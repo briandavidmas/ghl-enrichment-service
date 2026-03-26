@@ -1,5 +1,5 @@
 """
-Manus AI Lead Enrichment Service v4.3
+Manus AI Lead Enrichment Service v4.4
 ======================================
 This FastAPI service receives a lead from Adstra GHL via webhook, performs
 AI-powered web research to enrich the lead (business ownership, business name,
@@ -10,6 +10,9 @@ Using the GHL API directly (instead of inbound webhooks) ensures:
 - No duplicate contacts are created
 - No workflow loops are triggered
 - Updates are applied precisely to the correct contact
+
+v4.4 Changes:
+- Write firstName and lastName to Centerfy contacts during enrichment (fixes missing last name)
 
 v4.3 Changes:
 - Phone number fallback lookup when email lookup fails
@@ -110,7 +113,7 @@ CENTERFY_FIELD_IDS = {
 app = FastAPI(
     title="Manus Lead Enrichment Service",
     description="AI-powered lead enrichment using GHL API v2 for direct contact updates.",
-    version="4.3.0",
+    version="4.4.0",
 )
 
 
@@ -199,11 +202,12 @@ def find_contact(email: str, phone: str, api_key: str, location_id: str) -> str 
 # ---------------------------------------------------------------------------
 # GHL API: Update contact custom fields
 # ---------------------------------------------------------------------------
-def update_contact_fields(contact_id: str, enrichment: dict, api_key: str, location_id: str, destination: str) -> bool:
+def update_contact_fields(contact_id: str, enrichment: dict, api_key: str, location_id: str, destination: str, lead_data: dict = None) -> bool:
     """
     Updates a GHL contact's custom fields using the GHL API v2.
     Uses the customFields array format with field IDs.
     NEVER overwrites email, phone, or companyName with empty values.
+    Writes firstName and lastName if provided and non-empty.
     """
     if not api_key or not location_id or not contact_id:
         logger.warning(f"{destination}: Missing API key, location ID, or contact ID — skipping.")
@@ -242,6 +246,14 @@ def update_contact_fields(contact_id: str, enrichment: dict, api_key: str, locat
     payload = {"customFields": custom_fields}
     if business_name:
         payload["companyName"] = business_name
+    # Write firstName and lastName only if non-empty (never blank out existing names)
+    if lead_data:
+        first_name = (lead_data.get("first_name") or "").strip()
+        last_name  = (lead_data.get("last_name")  or "").strip()
+        if first_name:
+            payload["firstName"] = first_name
+        if last_name:
+            payload["lastName"] = last_name
 
     try:
         response = requests.put(
@@ -473,7 +485,7 @@ def update_ghl_contact(email: str, phone: str, lead_data: dict, enrichment: dict
 
     if contact_id:
         logger.info(f"Found contact {contact_id} in {destination} — updating fields")
-        update_contact_fields(contact_id, enrichment, api_key, location_id, destination)
+        update_contact_fields(contact_id, enrichment, api_key, location_id, destination, lead_data=lead_data)
     elif create_if_missing:
         logger.info(f"Contact not found in {destination} — creating new contact")
         create_contact_adstra(lead_data, enrichment)
