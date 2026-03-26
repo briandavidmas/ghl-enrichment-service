@@ -1,5 +1,4 @@
-"""
-Manus AI Lead Enrichment Service v4.4
+"""\n    Manus AI Lead Enrichment Service v4.5
 ======================================
 This FastAPI service receives a lead from Adstra GHL via webhook, performs
 AI-powered web research to enrich the lead (business ownership, business name,
@@ -10,6 +9,10 @@ Using the GHL API directly (instead of inbound webhooks) ensures:
 - No duplicate contacts are created
 - No workflow loops are triggered
 - Updates are applied precisely to the correct contact
+
+v4.5 Changes:
+- Fix API Version header in update_contact_fields: use 2021-04-15 instead of 2021-07-28
+  so that lastName (and firstName) are correctly saved in Centerfy GHL contacts
 
 v4.4 Changes:
 - Write firstName and lastName to Centerfy contacts during enrichment (fixes missing last name)
@@ -260,7 +263,7 @@ def update_contact_fields(contact_id: str, enrichment: dict, api_key: str, locat
             f"{GHL_API_BASE}/contacts/{contact_id}",
             headers={
                 "Authorization": f"Bearer {api_key}",
-                "Version": "2021-07-28",
+                "Version": "2021-04-15",
                 "Content-Type": "application/json",
             },
             json=payload,
@@ -544,7 +547,7 @@ def run_enrichment_pipeline(lead_data: dict):
 # ---------------------------------------------------------------------------
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "service": "Manus Lead Enrichment Service v4.3"}
+    return {"status": "ok", "service": "Manus Lead Enrichment Service v4.5"}
 
 
 @app.post("/webhook/lead")
